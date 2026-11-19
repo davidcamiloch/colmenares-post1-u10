@@ -162,6 +162,40 @@ Un minor page fault cuesta entre 860 y 930 ns en esta máquina. El segundo toque
 - `mmap_fault_cost.c` acepta el argumento `populate`, que agrega `MAP_POPULATE`, para medir la Decisión técnica 4 con el mismo programa.
 - Se agregó `populate_waste.c`, que reserva 100 MB y toca solo 10 MB, para medir el desperdicio que evita el demand paging.
 
+### Decisión técnica 3: `/proc/PID/smaps` o `pmap -x`
+
+`pmap -x` sí reporta la RAM de cada región: su columna RSS coincide con el campo Rss de `smaps` (1 032 kB para el código de libc en ambos). Lo que no expone es la composición de esa RAM: no separa Private_Dirty de Shared_Clean, solo da una columna Dirty, y no muestra Referenced, Anonymous, Swap ni Pss. Para el Checkpoint 2, que pide distinguir páginas privadas sucias de compartidas limpias región por región, `smaps` es indispensable. La medición de costo tiene un matiz. `strace` muestra que `pmap -x` abre `/proc/PID/smaps` para construir su tabla, así que no lee menos datos del kernel; leer `smaps` 1 000 veces tomó 0,68 s y ejecutar `pmap -x` 1 000 veces tomó 1,27 s por el costo de crear el proceso. Lo que sí cambia es el volumen de salida: 625 líneas de `smaps` frente a 29 de `pmap -x` para un proceso de 25 regiones, y en un proceso con cientos de regiones esa diferencia crece en proporción. En un script de monitoreo que consulta la memoria cada segundo importa más ese volumen que el costo de lectura: filtrar 625 líneas con `grep` o `awk` es lento y frágil, mientras que la tabla de `pmap -x` ya trae una fila por región y un total. Para monitoreo frecuente el resumen de `pmap -x` basta; si solo interesa el total, `/proc/PID/smaps_rollup` o `VmRSS` de `/proc/PID/status` son todavía más baratos. La regla es usar `pmap -x` para una inspección rápida en terminal y leer `smaps` cuando el análisis necesita clasificar cada página.
+
+### Decisión técnica 4: `MAP_POPULATE` o demand paging por defecto
+
+Con `MAP_POPULATE` el kernel asigna y mapea las 200 páginas dentro de la propia llamada a `mmap`, así que el bucle de primer toque ya no encuentra páginas ausentes. La medición lo confirma: el primer toque bajó de 876 a 948 ns a unos 25 ns, casi igual al segundo toque de 16,7 ns, y el overhead atribuible quedó en 8 a 10 ns. Los faults no desaparecieron; su costo se movió a `mmap`. `populate_waste.c` lo cuantifica sobre 100 MB: con demand paging `mmap` tarda 0,00 ms, con `MAP_POPULATE` tarda entre 18,6 y 19,7 ms, y después tocar 10 MB cuesta entre 3,2 y 3,6 ms en el primer caso y entre 1,0 y 1,5 ms en el segundo. Pagar por adelantado conviene a un servidor que atiende peticiones con latencia baja y predecible: es mejor un arranque 19 ms más lento que una petición que tarde 900 ns de más por cada página nueva. Un programa de ejecución única que reserva un buffer generoso conviene con demand paging, porque paga solo lo que usa. Ese es el desperdicio que evita el comportamiento por defecto: el proceso que reserva 100 MB y toca 10 MB termina con VmRSS de 11 964 kB con demand paging y de 104 124 kB con `MAP_POPULATE`, unos 90 MB de marcos físicos asignados, puestos a cero y nunca usados. La regla es poblar por adelantado solo la memoria que se sabe que se va a usar y en el camino crítico de latencia.
+
+## Capturas
+
+| Archivo | Checkpoint |
+|---------|------------|
+| `capturas/p1-cp1-tamanos-cache.png` | P1 CP1: tamaños de caché de `/sys` |
+| `capturas/p1-cp1-geometria-cache.png` | P1 CP1: vías, sets, línea y `lscpu` |
+| `capturas/p1-cp2-tabla-latencia-O0.png` | P1 CP2: compilación con `-O0` y tabla completa |
+| `capturas/p1-cp2-tabla-latencia-O2.png` | P1 CP2: la misma tabla compilada con `-O2` |
+| `capturas/p1-cp3-aleatorio-vs-secuencial.png` | P1 CP3: razones aleatorio/secuencial por tamaño |
+| `capturas/p1-cp3-tabla-O2-prefetch.png` | P1 CP3: tabla con `-O2 -fprefetch-loop-arrays` |
+| `capturas/p1-cp4-stride-O0.png` | P1 CP4: stride 64, 4 096 y 4 160 B con `-O0` |
+| `capturas/p1-cp4-stride-O2.png` | P1 CP4: stride con ambos flags de prefetch |
+| `capturas/p1-cp5-geometria-stride.png` | P1 CP5: `getconf` y sets que toca cada stride |
+| `capturas/p1-cp5-prefetch-asm.png` | P1 CP5: instrucciones `prefetcht0` en el ensamblador |
+| `capturas/p2-cp1-mapa-maps.png` | P2 CP1: salida de `mymaps` y `/proc/PID/maps` |
+| `capturas/p2-cp1-pmap-x.png` | P2 CP1: `pmap -x` del mismo proceso |
+| `capturas/p2-cp2-smaps-private-dirty.png` | P2 CP2: `smaps` de `[heap]` y `[stack]` |
+| `capturas/p2-cp2-smaps-shared-clean.png` | P2 CP2: `smaps` del código de libc |
+| `capturas/p2-cp2-vmstat-free.png` | P2 CP2: `pmap -x $$`, `vmstat -s` y `free -h` |
+| `capturas/p2-cp3-vmrss-memset.png` | P2 CP3: VmRSS y minflt antes y después del `memset` |
+| `capturas/p2-cp3-time-v.png` | P2 CP3: `/usr/bin/time -v` |
+| `capturas/p2-cp4-fault-demand.png` | P2 CP4: costo del fault con demand paging |
+| `capturas/p2-cp4-fault-populate.png` | P2 CP4: el mismo programa con `MAP_POPULATE` |
+| `capturas/p2-cp5-smaps-vs-pmap.png` | P2 CP5: líneas, tiempos y `strace` de `pmap -x` |
+| `capturas/p2-cp5-populate-desperdicio.png` | P2 CP5: VmRSS de 100 MB reservados y 10 MB usados |
+
 ## Referencias
 
 - Drepper, U. (2007). *What every programmer should know about memory*. Red Hat. https://people.freebsd.org/~lstewart/articles/cpumemory.pdf
