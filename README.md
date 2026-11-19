@@ -130,6 +130,38 @@ La `p` final indica mapeo privado con copia en escritura. El bloque de 1 MB no a
 
 El heap y la pila son Private_Dirty: son memoria anónima que solo existe en este proceso y que el programa ya escribió, así que no tienen copia en disco y no pueden compartirse. El código de libc es Shared_Clean: se mapea desde `/usr/lib/x86_64-linux-gnu/libc.so.6` con permiso de solo lectura, nunca se modifica y el kernel usa los mismos marcos físicos de la caché de páginas para todos los procesos que cargan libc; si necesita memoria puede descartar esas páginas y volver a leerlas del archivo. `vmstat -s` y `free -h` muestran el contexto del sistema: 3,8 GiB en total, 123 MiB usados y sin swap.
 
+### Checkpoint 3: VmRSS y conteo de page faults
+
+| Momento | VmSize | VmRSS | minflt |
+|---------|-------:|------:|-------:|
+| Antes del `memset` | 105 184 kB | 1 592 kB | 82 |
+| Después del `memset` | 105 184 kB | 104 112 kB | 25 684 |
+
+`malloc(100 MB)` solo reserva direcciones virtuales: VmSize ya incluye los 100 MB pero VmRSS sigue en 1,6 MB. El `memset` toca cada página por primera vez y cada toque genera un minor fault que asigna un marco físico. La diferencia queda así.
+
+```
+25 684 − 82 = 25 602 minor faults ≈ 100 MB / 4 KB = 25 600 páginas
+```
+
+`/usr/bin/time -v` reporta 26 031 minor faults (incluye la carga del programa y los procesos de `system()`) y 0 major faults: ninguna página tuvo que leerse del disco, porque todas eran anónimas y nuevas.
+
+### Checkpoint 4: costo medido de un minor page fault
+
+| Ejecución | Primer toque | Segundo toque | Overhead del fault |
+|-----------|-------------:|--------------:|-------------------:|
+| 1 | 876,1 ns | 15,8 ns | 860,3 ns |
+| 2 | 948,3 ns | 16,6 ns | 931,7 ns |
+| 3 | 926,7 ns | 16,5 ns | 910,2 ns |
+
+Un minor page fault cuesta entre 860 y 930 ns en esta máquina. El segundo toque, de 16 ns, es casi todo el costo de las dos llamadas a `clock_gettime` por el vDSO. El fault es unas 8 veces más lento que un acceso a RAM (117 ns en la Parte 1) y unas 750 veces más lento que un acceso a L1 (1,2 ns): incluye la excepción, el cambio a modo kernel, la reserva y puesta a cero de un marco de 4 KB y la actualización de la tabla de páginas.
+
+### Desviaciones respecto a la guía (Parte 2)
+
+- `pagefault_demo.c` lee `/proc/$PPID/status` y no `/proc/self/status`. `system()` ejecuta `grep` en otro proceso, y dentro de ese proceso `/proc/self` es el propio `grep`; la versión de la guía mostraba la memoria de `grep` y no la del programa. `$PPID` en el shell que lanza `system()` es el PID del programa. También se agregó `fflush(stdout)` antes de `system()` y la lectura de `minflt` y `majflt` desde `/proc/self/stat`.
+- `mymaps` se lanza con `(sleep 3 | ./mymaps) &`. En un shell no interactivo la entrada de un proceso en segundo plano es `/dev/null`, `getchar()` devuelve EOF de inmediato y el proceso termina antes del `cat`. La tubería mantiene la entrada abierta 3 segundos.
+- `mmap_fault_cost.c` acepta el argumento `populate`, que agrega `MAP_POPULATE`, para medir la Decisión técnica 4 con el mismo programa.
+- Se agregó `populate_waste.c`, que reserva 100 MB y toca solo 10 MB, para medir el desperdicio que evita el demand paging.
+
 ## Referencias
 
 - Drepper, U. (2007). *What every programmer should know about memory*. Red Hat. https://people.freebsd.org/~lstewart/articles/cpumemory.pdf
