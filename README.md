@@ -98,6 +98,38 @@ El stride que lleva todos los accesos al mismo set es el tamaño de la caché di
 
 `-fprefetch-loop-arrays` y `-fno-prefetch-loop-arrays` solo controlan si gcc inserta instrucciones `prefetcht0` en el código que genera; el prefetcher de hardware vive en el procesador, observa las direcciones en tiempo de ejecución y funciona igual con cualquiera de los dos binarios. La captura `p1-cp5-prefetch-asm.png` lo muestra: con `-O2 -fprefetch-loop-arrays` el ensamblador contiene 8 instrucciones `prefetcht0` y con `-fno-prefetch-loop-arrays` contiene 0; las 8 están en los bucles de inicialización y de recorrido de `bench_rand` y `bench_chase`, y ninguna en `bench_seq`, porque gcc no inserta prefetch para accesos `volatile`. El patrón secuencial es el que el compilador puede predecir y el más sensible a la diferencia; en `bench_rand` el compilador anticipa el arreglo `idx`, que se lee en orden, y a 1 MB la medición baja de 0,846 a 0,601 ns. El acceso a `arr[idx[i]]` sigue una mezcla Fisher-Yates y el recorrido de stride 4 096 depende de conflictos de asociatividad; ningún prefetch insertado en compilación puede anticiparlos, y por eso a 64 MB los dos binarios dan 9,1 ns y el stride de 4 096 da 3,5 y 3,7 ns. La columna `seq` es idéntica con ambos flags (0,13 a 0,17 ns/byte) porque el prefetcher de hardware ya cubre ese recorrido. El prefetcher de hardware solo se desactiva con registros MSR o desde la BIOS, y dentro de una máquina virtual ni siquiera eso está disponible. La conclusión válida es limitada: la comparación mide el aporte del prefetch por software de gcc sobre un procesador que ya hace prefetch por hardware, no el valor del prefetching en general. La regla es atribuir a `-fprefetch-loop-arrays` solo las instrucciones que aparecen en el ensamblador.
 
+## Parte 2: Análisis de memoria virtual en Linux
+
+### Checkpoint 1: regiones de `/proc/PID/maps`
+
+`mymaps` imprime la dirección de una variable de pila, del bloque de heap, de una global, de la cadena constante y de `main`, y espera en `getchar()`.
+
+| Rango (ejemplo de la ejecución) | Permisos | Región | Propósito |
+|---------------------------------|----------|--------|-----------|
+| `611dbfdc2000-611dbfdc3000` | `r--p` | `mymaps` (encabezados ELF) | Cabecera y tablas del ejecutable |
+| `611dbfdc3000-611dbfdc4000` | `r-xp` | `mymaps` (.text) | Código; contiene `main` en `611dbfdc3229` |
+| `611dbfdc4000-611dbfdc5000` | `r--p` | `mymaps` (.rodata) | Constantes; contiene `"hola"` en `611dbfdc4008` |
+| `611dbfdc6000-611dbfdc7000` | `rw-p` | `mymaps` (.data/.bss) | Globales; `global_data` en `611dbfdc6010` |
+| `611dfeff2000-611dff013000` | `rw-p` | `[heap]` | Heap de `brk` para bloques pequeños de malloc |
+| `7d2f936ff000-7d2f93800000` | `rw-p` | anónima | El bloque de 1 MB de `malloc`, en `7d2f936ff010` |
+| `7d2f93828000-7d2f939bd000` | `r-xp` | `libc.so.6` | Código de la biblioteca C, compartido |
+| `7d2f93a74000-7d2f93a9e000` | `r-xp` | `ld-linux-x86-64.so.2` | Cargador dinámico |
+| `7ffced2f8000-7ffced31a000` | `rw-p` | `[stack]` | Pila; la variable `heap` está en `7ffced317970` |
+| `7ffced37e000-7ffced382000` | `r--p` | `[vvar]` | Datos del kernel que lee el vDSO |
+| `7ffced382000-7ffced384000` | `r-xp` | `[vdso]` | Código del kernel mapeado en el proceso: `clock_gettime` sin syscall |
+
+La `p` final indica mapeo privado con copia en escritura. El bloque de 1 MB no aparece dentro de `[heap]`: glibc atiende con `mmap` toda petición mayor que `M_MMAP_THRESHOLD` (128 KB por defecto), así que crea una región anónima propia.
+
+### Checkpoint 2: clasificación de páginas en `smaps`
+
+| Región | Rss | Private_Dirty | Shared_Clean | Referenced |
+|--------|----:|--------------:|-------------:|-----------:|
+| `[heap]` | 12 kB | 12 kB | 0 kB | 12 kB |
+| `[stack]` | 16 kB | 16 kB | 0 kB | 16 kB |
+| `libc.so.6` (r-xp) | 1 032 kB | 0 kB | 1 032 kB | 1 032 kB |
+
+El heap y la pila son Private_Dirty: son memoria anónima que solo existe en este proceso y que el programa ya escribió, así que no tienen copia en disco y no pueden compartirse. El código de libc es Shared_Clean: se mapea desde `/usr/lib/x86_64-linux-gnu/libc.so.6` con permiso de solo lectura, nunca se modifica y el kernel usa los mismos marcos físicos de la caché de páginas para todos los procesos que cargan libc; si necesita memoria puede descartar esas páginas y volver a leerlas del archivo. `vmstat -s` y `free -h` muestran el contexto del sistema: 3,8 GiB en total, 123 MiB usados y sin swap.
+
 ## Referencias
 
 - Drepper, U. (2007). *What every programmer should know about memory*. Red Hat. https://people.freebsd.org/~lstewart/articles/cpumemory.pdf
